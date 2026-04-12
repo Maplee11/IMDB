@@ -37,25 +37,73 @@ def tokenize(x, tokenizer, max_seq_len):
     return input_ids_list, attention_mask_list
 
 
-def save_checkpoint(path, model, optimizer):
+def save_checkpoint(path, model, optimizer, scheduler=None, metadata=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    if metadata is not None:
+        payload["metadata"] = metadata
     torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        },
+        payload,
         path,
     )
     print(f"Saved checkpoint to: {path}")
 
 
-def load_checkpoint(path, model, optimizer=None, device=None):
+def load_checkpoint(path, model, optimizer=None, scheduler=None, device=None):
     ckpt = torch.load(path, map_location=device if device is not None else "cpu")
     model.load_state_dict(ckpt["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     print(f"Loaded checkpoint from: {path}")
-    return model, optimizer
+    return model, optimizer, scheduler, ckpt.get("metadata")
+
+
+def evaluate(model, dataloader, criterion, device, amp_dtype, use_amp):
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids, attention_mask, labels = [t.to(device) for t in batch]
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                logits = model(input_ids, attention_mask)
+                loss = criterion(logits, labels)
+
+            probs = torch.sigmoid(logits.float())
+            preds = (probs > 0.5).long().view(-1)
+            y_true = (labels > 0.5).long().view(-1)
+
+            batch_size = y_true.size(0)
+            total_loss += loss.item() * batch_size
+            total_correct += (preds == y_true).sum().item()
+            total_samples += batch_size
+
+    avg_loss = total_loss / max(total_samples, 1)
+    accuracy = total_correct / max(total_samples, 1)
+    return avg_loss, accuracy
+
+
+def build_lr_scheduler(optimizer, total_steps):
+    warmup_steps = max(1, int(total_steps * WARMUP_RATIO))
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step + 1) / float(warmup_steps)
+
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, float(current_step - warmup_steps) / float(decay_steps))
+        return max(MIN_LR_RATIO, 1.0 - (1.0 - MIN_LR_RATIO) * progress)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # initialize
@@ -93,7 +141,11 @@ valid_dataloader = DataLoader(valid_dataset, batch_size=VALID_BATCH_SIZE, shuffl
 # define model
 model = BinaryClassifyModel(len(tokenizer), HIDDEN_DIM, MAX_SEQ_LEN, DROPOUT_RATE, N_ENCODER_LAYER, N_HEAD).to(device)
 criterion = nn.BCEWithLogitsLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+total_training_steps = TOTAL_EPOCHS * len(train_dataloader)
+scheduler = build_lr_scheduler(optimizer, total_training_steps)
+best_valid_acc = 0.0
+global_step = 0
 
 # train loop
 for epoch in range(TOTAL_EPOCHS):
@@ -101,41 +153,62 @@ for epoch in range(TOTAL_EPOCHS):
     for step, batch in enumerate(pbar):
         input_ids, attention_mask, labels = [t.to(device) for t in batch]
         model.train()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(input_ids, attention_mask)
             loss = criterion(logits, labels)
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
         optimizer.step()
+        scheduler.step()
+        global_step += 1
 
         # log loss
         if step % TRAIN_LOG_INTERVAL == 0 or step == len(train_dataloader) - 1:
-            pbar.set_postfix_str(f"Loss={loss.item():.6f}")
-            tqdm.write(colorize(f"Epoch {epoch}, Step {step}, Loss: {loss.item():.6f}", YELLOW))
+            lr = scheduler.get_last_lr()[0]
+            pbar.set_postfix_str(f"Loss={loss.item():.6f} LR={lr:.2e}")
+            tqdm.write(
+                colorize(
+                    f"Epoch {epoch + 1}, Step {step + 1}, Loss: {loss.item():.6f}, "
+                    f"GradNorm: {float(grad_norm):.4f}, LR: {lr:.2e}",
+                    YELLOW,
+                )
+            )
 
         # validate
         if step % VALIDATE_INTERVAL == 0 or step == len(train_dataloader) - 1:
-            model.eval()
-            with torch.no_grad():
-                total_correct = 0
-                total_samples = 0
-                for batch in valid_dataloader:
-                    input_ids, attention_mask, labels = [t.to(device) for t in batch]
-                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                        logits = model(input_ids, attention_mask)
-                        loss = criterion(logits, labels)
+            valid_loss, valid_acc = evaluate(model, valid_dataloader, criterion, device, amp_dtype, use_amp)
+            tqdm.write(colorize(f"Valid: Loss={valid_loss:.6f} Acc={valid_acc * 100:.2f}%", GREEN))
 
-                    # accuracy
-                    probs = torch.sigmoid(logits.float())
-                    preds = (probs > 0.5).long().view(-1)
-                    y_true = (labels > 0.5).long().view(-1)
-                    total_correct += (preds == y_true).sum().item()
-                    total_samples += y_true.size(0)
+            if valid_acc > best_valid_acc:
+                best_valid_acc = valid_acc
+                save_checkpoint(
+                    BEST_CKPT_PATH,
+                    model,
+                    optimizer,
+                    scheduler=scheduler,
+                    metadata={
+                        "epoch": epoch + 1,
+                        "step": step + 1,
+                        "global_step": global_step,
+                        "best_valid_acc": best_valid_acc,
+                        "valid_loss": valid_loss,
+                    },
+                )
+                tqdm.write(colorize(f"New best checkpoint: Acc={best_valid_acc * 100:.2f}%", CYAN))
 
-            tqdm.write(colorize(f"Valid: Acc={total_correct / total_samples * 100:.2f}%", GREEN))
 
-
-save_checkpoint(CKPT_PATH, model, optimizer)
+save_checkpoint(
+    CKPT_PATH,
+    model,
+    optimizer,
+    scheduler=scheduler,
+    metadata={
+        "epoch": TOTAL_EPOCHS,
+        "global_step": global_step,
+        "best_valid_acc": best_valid_acc,
+    },
+)
 
 # loaded_model = BinaryClassifyModel(len(tokenizer), HIDDEN_DIM, MAX_SEQ_LEN, DROPOUT_RATE, N_ENCODER_LAYER, N_HEAD).to(device)
-# load_checkpoint(CKPT_PATH, loaded_model, optimizer=None, device=device)
+# load_checkpoint(CKPT_PATH, loaded_model, optimizer=None, scheduler=None, device=device)

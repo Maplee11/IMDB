@@ -8,17 +8,21 @@ MAX_SEQ_LEN = 384
 
 # ========== Model Config ==========
 HIDDEN_DIM = 384
-DEFAULT_DTYPE = torch.bfloat16
+DEFAULT_DTYPE = torch.float32
 DROPOUT_RATE = 0.1
-N_ENCODER_LAYER = 4
+N_ENCODER_LAYER = 2
 N_HEAD = 4
 
 # ========== Training Config ==========
 LR = 3e-4
-TOTAL_EPOCHS = 2
+MIN_LR_RATIO = 0.1
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.05
+GRAD_CLIP_NORM = 1.0
+TOTAL_EPOCHS = 5
 TRAIN_BATCH_SIZE = 128
 VALID_BATCH_SIZE = 128
-VALIDATE_INTERVAL = 50
+VALIDATE_INTERVAL = 100
 TRAIN_LOG_INTERVAL = 25
 
 # ========== Color Config ==========
@@ -30,3 +34,4 @@ YELLOW = "\033[33m"
 
 # ========== Checkpoint Config ==========
 CKPT_PATH = os.path.join("checkpoints", "imdb_binary_cls.pt")
+BEST_CKPT_PATH = os.path.join("checkpoints", "imdb_binary_cls_best.pt")
