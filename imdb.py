@@ -11,11 +11,6 @@ import torch.nn as nn
 from transformer import BinaryClassifyModel
 from config import *
 
-RESET = "\033[0m"
-BOLD = "\033[1m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
 
 def colorize(text, color):
     return f"{color}{text}{RESET}" if sys.stdout.isatty() else text
@@ -113,7 +108,7 @@ for epoch in range(TOTAL_EPOCHS):
         loss.backward()
         optimizer.step()
 
-        # log
+        # log loss
         if step % TRAIN_LOG_INTERVAL == 0 or step == len(train_dataloader) - 1:
             pbar.set_postfix_str(f"Loss={loss.item():.6f}")
             tqdm.write(colorize(f"Epoch {epoch}, Step {step}, Loss: {loss.item():.6f}", YELLOW))
@@ -122,7 +117,6 @@ for epoch in range(TOTAL_EPOCHS):
         if step % VALIDATE_INTERVAL == 0 or step == len(train_dataloader) - 1:
             model.eval()
             with torch.no_grad():
-                total_loss = 0.0
                 total_correct = 0
                 total_samples = 0
                 for batch in valid_dataloader:
@@ -130,7 +124,6 @@ for epoch in range(TOTAL_EPOCHS):
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         logits = model(input_ids, attention_mask)
                         loss = criterion(logits, labels)
-                    total_loss += loss.item()
 
                     # accuracy
                     probs = torch.sigmoid(logits.float())
@@ -139,11 +132,10 @@ for epoch in range(TOTAL_EPOCHS):
                     total_correct += (preds == y_true).sum().item()
                     total_samples += y_true.size(0)
 
-            tqdm.write(colorize(f"Valid: Acc={total_correct / total_samples * 100:.2f}%  Loss={total_loss / len(valid_dataloader)}", GREEN))
+            tqdm.write(colorize(f"Valid: Acc={total_correct / total_samples * 100:.2f}%", GREEN))
 
 
-ckpt_path = os.path.join("checkpoints", "imdb_binary_cls.pt")
-save_checkpoint(ckpt_path, model, optimizer)
+save_checkpoint(CKPT_PATH, model, optimizer)
 
 # loaded_model = BinaryClassifyModel(len(tokenizer), HIDDEN_DIM, MAX_SEQ_LEN, DROPOUT_RATE, N_ENCODER_LAYER, N_HEAD).to(device)
-# load_checkpoint(ckpt_path, loaded_model, optimizer=None, device=device)
+# load_checkpoint(CKPT_PATH, loaded_model, optimizer=None, device=device)
