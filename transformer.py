@@ -1,4 +1,3 @@
-from mpmath.ctx_mp_python import return_mpc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -115,6 +114,7 @@ class BinaryClassifyModel(nn.Module):
         )
 
         self.final_ln = nn.LayerNorm(hidden_dim)
+        self.cls_dropout = nn.Dropout(dropout_rate)
         self.classifier = nn.Linear(hidden_dim, 1)
 
 
@@ -124,16 +124,9 @@ class BinaryClassifyModel(nn.Module):
         x = self.encoder(x, src_key_padding_mask=(attention_mask == 0))
         x = self.final_ln(x)
 
-        # 清理 padding 位置
-        x = x * attention_mask.unsqueeze(-1)
-
-        # sum pooling
-        # x: [bs, seq_len, hidden_dim]
-        x = torch.sum(x, dim=1)
-        valid_len = torch.sum(attention_mask, dim=1, keepdim=True).float()
-        x = x / torch.clamp(valid_len, min=1e-9)
-
-        logits = self.classifier(x) # [bs, 1]
+        # 第 0 个位置对应手工插入的 [CLS] token。
+        cls_hidden = self.cls_dropout(x[:, 0, :])
+        logits = self.classifier(cls_hidden) # [bs, 1]
 
         return logits
 
@@ -172,4 +165,3 @@ class BinaryClassifyModel_(nn.Module):
 
         return logits
         
-
