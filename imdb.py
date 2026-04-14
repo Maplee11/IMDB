@@ -199,25 +199,24 @@ try:
             lr = scheduler.get_last_lr()[0]
 
             # log loss
-            if step % TRAIN_LOG_INTERVAL == 0 or step == len(train_dataloader) - 1:
-                pbar.set_postfix_str(f"Loss={loss.item():.6f} LR={lr:.2e}")
-                tqdm.write(
-                    colorize(
-                        f"Epoch {epoch + 1}, Step {step + 1}, Loss: {loss.item():.6f}, "
-                        f"GradNorm: {float(grad_norm):.4f}, LR: {lr:.2e}",
-                        YELLOW,
-                    )
+            pbar.set_postfix_str(f"Loss={loss.item():.6f} LR={lr:.2e}")
+            tqdm.write(
+                colorize(
+                    f"Epoch {epoch + 1}, Step {step + 1}, Loss: {loss.item():.6f}, "
+                    f"GradNorm: {float(grad_norm):.4f}, LR: {lr:.2e}",
+                    YELLOW,
                 )
-                swanlab.log(
-                    {
-                        "train/loss": loss.item(),
-                        "train/lr": lr,
-                        "train/grad_norm": float(grad_norm),
-                        "train/epoch": epoch + 1,
-                        "train/step_in_epoch": step + 1,
-                        "train/global_step": global_step,
-                    }
-                )
+            )
+            swanlab.log(
+                {
+                    "train/loss": loss.item(),
+                    "train/lr": lr,
+                    "train/grad_norm": float(grad_norm),
+                    "train/epoch": epoch + 1,
+                    "train/step_in_epoch": step + 1,
+                    "train/global_step": global_step,
+                }
+            )
 
             # validate
             if step % VALIDATE_INTERVAL == 0 or step == len(train_dataloader) - 1:
