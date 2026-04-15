@@ -12,6 +12,7 @@ DEFAULT_DTYPE = torch.float32
 DROPOUT_RATE = 0.1
 N_ENCODER_LAYER = 2
 N_HEAD = 4
+POOLING_TYPE = "cls"  # options: "cls", "max_mean"
 
 # ========== Training Config ==========
 LR = 3e-4
@@ -20,7 +21,7 @@ WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.05
 GRAD_CLIP_NORM = 1.0
 
-TOTAL_EPOCHS = 5
+TOTAL_EPOCHS = 15
 
 TRAIN_BATCH_SIZE = 128
 VALID_BATCH_SIZE = 128

@@ -90,12 +90,13 @@ class Decoder(nn.Module):
 
 
 class BinaryClassifyModel(nn.Module):
-    def __init__(self, vocab_size, hidden_dim, max_seq_len, dropout_rate, n_encoder_layer, n_head):
+    def __init__(self, vocab_size, hidden_dim, max_seq_len, dropout_rate, n_encoder_layer, n_head, pooling_type="cls"):
         super().__init__()
 
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
+        self.pooling_type = pooling_type.lower()
 
         self.embd_layer = TransformerEmbedding(vocab_size, hidden_dim, max_seq_len, dropout_rate)
         
@@ -114,8 +115,9 @@ class BinaryClassifyModel(nn.Module):
         )
 
         self.final_ln = nn.LayerNorm(hidden_dim)
-        self.cls_dropout = nn.Dropout(dropout_rate)
-        self.classifier = nn.Linear(hidden_dim, 1)
+        self.pooling_dropout = nn.Dropout(dropout_rate)
+        classifier_input_dim = hidden_dim if self.pooling_type == "cls" else hidden_dim * 2
+        self.classifier = nn.Linear(classifier_input_dim, 1)
 
 
     def forward(self, input_ids, attention_mask):
@@ -124,9 +126,23 @@ class BinaryClassifyModel(nn.Module):
         x = self.encoder(x, src_key_padding_mask=(attention_mask == 0))
         x = self.final_ln(x)
 
-        # 第 0 个位置对应手工插入的 [CLS] token。
-        cls_hidden = self.cls_dropout(x[:, 0, :])
-        logits = self.classifier(cls_hidden) # [bs, 1]
+        if self.pooling_type == "cls":
+            pooled = x[:, 0, :]
+        elif self.pooling_type == "max_mean":
+            mask = attention_mask.unsqueeze(-1).bool()
+            masked_x = x.masked_fill(~mask, float("-inf"))
+            max_pooled = masked_x.max(dim=1).values
+            max_pooled = torch.where(torch.isfinite(max_pooled), max_pooled, torch.zeros_like(max_pooled))
+
+            masked_sum = (x * attention_mask.unsqueeze(-1)).sum(dim=1)
+            valid_len = attention_mask.sum(dim=1, keepdim=True).clamp(min=1).to(x.dtype)
+            mean_pooled = masked_sum / valid_len
+            pooled = torch.cat([max_pooled, mean_pooled], dim=-1)
+        else:
+            raise ValueError(f"Unsupported pooling type: {self.pooling_type}")
+
+        pooled = self.pooling_dropout(pooled)
+        logits = self.classifier(pooled) # [bs, 1]
 
         return logits
 

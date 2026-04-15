@@ -36,26 +36,34 @@ def load_data(data_dir):
     return x, y
 
 
-def tokenize(x, tokenizer, max_seq_len):
+def tokenize(x, tokenizer, max_seq_len, pooling_type):
     input_ids_list = []
     attention_mask_list = []
-    cls_id = tokenizer.cls_token_id
-    pad_id = tokenizer.pad_token_id
+    pooling_type = pooling_type.lower()
+
+    if pooling_type == "cls":
+        cls_id = tokenizer.cls_token_id
+        pad_id = tokenizer.pad_token_id
 
     for review in tqdm(x):
-        tokens = tokenizer(
-            review,
-            truncation=True,
-            max_length=max_seq_len - 1,
-            padding=False,
-            add_special_tokens=False,
-        )
-        input_ids = [cls_id] + tokens["input_ids"]
-        attention_mask = [1] + tokens["attention_mask"]
+        if pooling_type == "cls":
+            tokens = tokenizer(
+                review,
+                truncation=True,
+                max_length=max_seq_len - 1,
+                padding=False,
+                add_special_tokens=False,
+            )
+            input_ids = [cls_id] + tokens["input_ids"]
+            attention_mask = [1] + tokens["attention_mask"]
 
-        pad_len = max_seq_len - len(input_ids)
-        input_ids += [pad_id] * pad_len
-        attention_mask += [0] * pad_len
+            pad_len = max_seq_len - len(input_ids)
+            input_ids += [pad_id] * pad_len
+            attention_mask += [0] * pad_len
+        else:
+            tokens = tokenizer(review, truncation=True, max_length=max_seq_len, padding="max_length")
+            input_ids = tokens["input_ids"]
+            attention_mask = tokens["attention_mask"]
 
         input_ids_list.append(input_ids)
         attention_mask_list.append(attention_mask)
@@ -134,12 +142,13 @@ x_valid, y_valid = load_data(os.path.join(IMDB_DATASET_DIR, "test.json"))
 # get tokenizer
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2", cache_dir="./gpt2_tokenizer")
 tokenizer.pad_token = tokenizer.eos_token
-tokenizer.add_special_tokens({"cls_token": "<|cls|>"})
+if POOLING_TYPE.lower() == "cls":
+    tokenizer.add_special_tokens({"cls_token": "<|cls|>"})
 
 # tokenize and to tensor
 print("Tokenizing...")
-x_train, attention_mask_train = tokenize(x_train, tokenizer, MAX_SEQ_LEN)
-x_valid, attention_mask_valid = tokenize(x_valid, tokenizer, MAX_SEQ_LEN)
+x_train, attention_mask_train = tokenize(x_train, tokenizer, MAX_SEQ_LEN, POOLING_TYPE)
+x_valid, attention_mask_valid = tokenize(x_valid, tokenizer, MAX_SEQ_LEN, POOLING_TYPE)
 x_train = torch.tensor(x_train, dtype=torch.long)
 x_valid = torch.tensor(x_valid, dtype=torch.long)
 y_train = torch.tensor(y_train, dtype=torch.float).view(-1, 1)
@@ -154,7 +163,15 @@ train_dataloader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffl
 valid_dataloader = DataLoader(valid_dataset, batch_size=VALID_BATCH_SIZE, shuffle=False)
 
 # define model
-model = BinaryClassifyModel(len(tokenizer), HIDDEN_DIM, MAX_SEQ_LEN, DROPOUT_RATE, N_ENCODER_LAYER, N_HEAD).to(device)
+model = BinaryClassifyModel(
+    len(tokenizer),
+    HIDDEN_DIM,
+    MAX_SEQ_LEN,
+    DROPOUT_RATE,
+    N_ENCODER_LAYER,
+    N_HEAD,
+    pooling_type=POOLING_TYPE,
+).to(device)
 criterion = nn.BCEWithLogitsLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 total_training_steps = TOTAL_EPOCHS * len(train_dataloader)
@@ -188,8 +205,8 @@ swanlab.init(
         "train_size": len(train_dataset),
         "valid_size": len(valid_dataset),
         "tokenizer": "gpt2",
-        "pooling": "cls",
-        "cls_token": tokenizer.cls_token,
+        "pooling": POOLING_TYPE,
+        "cls_token": tokenizer.cls_token if POOLING_TYPE.lower() == "cls" else None,
     },
 )
 
@@ -240,7 +257,7 @@ try:
                         "valid/acc_percent": valid_acc * 100,
                         "valid/epoch": epoch + 1,
                         "valid/global_step": global_step,
-                        "best_valid_acc": max(best_valid_acc, valid_acc),
+                        "valid/best_valid_acc": max(best_valid_acc, valid_acc),
                     },
                     step=global_step,
                 )
