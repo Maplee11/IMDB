@@ -1,9 +1,8 @@
 __pycache__/
 .vscode/
 .DS_Store/
+
 swanlog/
 
-dataset/aclImdb/
-checkpoints/
-
-draft.txt
+imdb/dataset/aclImdb/*.json
+ckpts/
