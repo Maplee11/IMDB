@@ -3,6 +3,6 @@ __pycache__/
 .DS_Store/
 
 swanlog/
+ckpts/
 
 imdb/dataset/aclImdb/*.json
-ckpts/
