@@ -3,8 +3,7 @@ __pycache__/
 .DS_Store/
 swanlog/
 
-gpt2_tokenizer/
-dataset/
+dataset/aclImdb/
 checkpoints/
 
 draft.txt
