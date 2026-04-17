@@ -1,4 +1,5 @@
 __pycache__/
+
 .vscode/
 .DS_Store/
 
@@ -6,3 +7,5 @@ swanlog/
 ckpts/
 
 imdb/dataset/aclImdb/*.json
+
+predict.csv
