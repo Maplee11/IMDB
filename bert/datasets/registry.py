@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Dict, Type
 
@@ -17,4 +15,3 @@ def get_builder(dataset_name: str, *, root_dir: Path, tokenizer) -> DatasetBuild
     if builder_cls is None:
         raise ValueError(f"Unknown dataset: {dataset_name}. Available: {sorted(_BUILDERS)}")
     return builder_cls(root_dir=root_dir, tokenizer=tokenizer)
-
