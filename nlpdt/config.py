@@ -14,12 +14,12 @@ RANDOM_SEED = 42
 RUN_MODE = "all"  # options: train, predict, all
 
 # ========== Model Config ==========
-MAX_SEQ_LEN = 512
-HIDDEN_DIM = 512
+MAX_SEQ_LEN = 64
+HIDDEN_DIM = 300
 DEFAULT_DTYPE = torch.float32
-DROPOUT_RATE = 0.2
+DROPOUT_RATE = 0.3
 N_ENCODER_LAYER = 4
-N_HEAD = 8
+N_HEAD = 6
 POOLING_TYPE = "cls"  # options: "cls", "max_mean"
 
 # ========== Training Config ==========

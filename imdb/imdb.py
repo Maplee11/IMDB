@@ -69,6 +69,51 @@ def tokenize(x, tokenizer, max_seq_len, pooling_type):
         attention_mask_list.append(attention_mask)
     return input_ids_list, attention_mask_list
 
+def glove_candidates_for_token(token):
+    if token is None or token.startswith("<|"):
+        return []
+
+    stripped = token.lstrip("ĠĊ")
+    candidates = []
+    for candidate in (token, token.lower(), stripped, stripped.lower()):
+        if candidate and candidate not in candidates and not candidate.startswith("<|"):
+            candidates.append(candidate)
+    return candidates
+
+
+def build_glove_embedding_weight(glove_path, tokenizer, embedding_dim):
+    token_to_ids = {}
+    for token_id in range(len(tokenizer)):
+        token = tokenizer.convert_ids_to_tokens(token_id)
+        for candidate in glove_candidates_for_token(token):
+            token_to_ids.setdefault(candidate, []).append(token_id)
+
+    embedding_weight = torch.empty(len(tokenizer), embedding_dim, dtype=torch.float32)
+    nn.init.normal_(embedding_weight, mean=0.0, std=0.02)
+
+    matched_token_ids = set()
+    with open(glove_path, "r", encoding="utf-8") as f:
+        for line in tqdm(f, desc="Loading GloVe", leave=False):
+            values = line.rstrip().split()
+            if len(values) != embedding_dim + 1:
+                continue
+
+            word = values[0]
+            token_ids = token_to_ids.get(word)
+            if not token_ids:
+                continue
+
+            vector = torch.tensor([float(v) for v in values[1:]], dtype=embedding_weight.dtype)
+            for token_id in token_ids:
+                if token_id not in matched_token_ids:
+                    embedding_weight[token_id] = vector
+                    matched_token_ids.add(token_id)
+
+    if tokenizer.pad_token_id is not None:
+        embedding_weight[tokenizer.pad_token_id].zero_()
+
+    return embedding_weight, len(matched_token_ids)
+
 
 def save_checkpoint(path, model, optimizer, scheduler=None, metadata=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -133,6 +178,8 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 amp_dtype = torch.bfloat16
 use_amp = device.type == "mps"
 SWANLAB_API_KEY = os.getenv("SWANLAB_API_KEY", "ZnWwDCFzy78QEM12FZXCr")
+GLOVE_PATH = "/Users/bytedance/code/ml/glove.6B.300d.txt"
+GLOVE_DIM = 300
 print("Using device: ", device)
 
 # load and shuffle data
@@ -140,10 +187,23 @@ x_train, y_train = load_data(os.path.join(IMDB_DATASET_DIR, "train.json"))
 x_valid, y_valid = load_data(os.path.join(IMDB_DATASET_DIR, "test.json"))
 
 # get tokenizer
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2", cache_dir="./gpt2_tokenizer")
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2", cache_dir="./gpt2_tokenizer", local_files_only=True)
 tokenizer.pad_token = tokenizer.eos_token
 if POOLING_TYPE.lower() == "cls":
     tokenizer.add_special_tokens({"cls_token": "<|cls|>"})
+
+if HIDDEN_DIM != GLOVE_DIM:
+    raise ValueError(f"HIDDEN_DIM ({HIDDEN_DIM}) must match GLOVE_DIM ({GLOVE_DIM}) when projection is disabled.")
+
+glove_embedding_weight, glove_matched_count = build_glove_embedding_weight(
+    GLOVE_PATH,
+    tokenizer,
+    embedding_dim=GLOVE_DIM,
+)
+print(
+    f"GloVe initialized {glove_matched_count}/{len(tokenizer)} tokenizer entries "
+    f"({glove_matched_count / len(tokenizer):.2%})"
+)
 
 # tokenize and to tensor
 print("Tokenizing...")
@@ -171,6 +231,7 @@ model = BinaryClassifyModel(
     N_ENCODER_LAYER,
     N_HEAD,
     pooling_type=POOLING_TYPE,
+    pretrained_embedding_weight=glove_embedding_weight,
 ).to(device)
 criterion = nn.BCEWithLogitsLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -207,6 +268,10 @@ swanlab.init(
         "tokenizer": "gpt2",
         "pooling": POOLING_TYPE,
         "cls_token": tokenizer.cls_token if POOLING_TYPE.lower() == "cls" else None,
+        "glove_path": GLOVE_PATH,
+        "glove_dim": GLOVE_DIM,
+        "glove_matched_count": glove_matched_count,
+        "glove_match_ratio": glove_matched_count / len(tokenizer),
     },
 )
 

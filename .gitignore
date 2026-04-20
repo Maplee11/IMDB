@@ -9,3 +9,4 @@ ckpts/
 imdb/dataset/aclImdb/*.json
 
 predict.csv
+glove.6B.300d.txt

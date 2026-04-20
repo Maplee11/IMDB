@@ -4,9 +4,25 @@ import torch.nn.functional as F
 
 
 class TransformerEmbedding(nn.Module):
-    def __init__(self, vocab_size, n_embed, max_seq_len, dropout_rate):
+    def __init__(
+        self,
+        vocab_size,
+        n_embed,
+        max_seq_len,
+        dropout_rate,
+        pretrained_weight=None,
+        freeze_embeddings=False,
+    ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_embed)
+        if pretrained_weight is not None:
+            if pretrained_weight.shape != (vocab_size, n_embed):
+                raise ValueError(
+                    "Expected pretrained_weight shape "
+                    f"{(vocab_size, n_embed)}, got {tuple(pretrained_weight.shape)}"
+                )
+            self.token_embedding.weight.data.copy_(pretrained_weight)
+        self.token_embedding.weight.requires_grad = not freeze_embeddings
         self.position_embedding = nn.Embedding(max_seq_len, n_embed)
         self.dropout = nn.Dropout(dropout_rate)
 
@@ -90,7 +106,18 @@ class Decoder(nn.Module):
 
 
 class BinaryClassifyModel(nn.Module):
-    def __init__(self, vocab_size, hidden_dim, max_seq_len, dropout_rate, n_encoder_layer, n_head, pooling_type="cls"):
+    def __init__(
+        self,
+        vocab_size,
+        hidden_dim,
+        max_seq_len,
+        dropout_rate,
+        n_encoder_layer,
+        n_head,
+        pooling_type="cls",
+        pretrained_embedding_weight=None,
+        freeze_embeddings=False,
+    ):
         super().__init__()
 
         self.vocab_size = vocab_size
@@ -98,7 +125,14 @@ class BinaryClassifyModel(nn.Module):
         self.max_seq_len = max_seq_len
         self.pooling_type = pooling_type.lower()
 
-        self.embd_layer = TransformerEmbedding(vocab_size, hidden_dim, max_seq_len, dropout_rate)
+        self.embd_layer = TransformerEmbedding(
+            vocab_size,
+            hidden_dim,
+            max_seq_len,
+            dropout_rate,
+            pretrained_weight=pretrained_embedding_weight,
+            freeze_embeddings=freeze_embeddings,
+        )
         
         self.encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, 

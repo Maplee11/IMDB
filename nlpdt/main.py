@@ -25,6 +25,8 @@ PREDICT_CSV_PATH = ROOT_DIR / PREDICT_CSV_PATH
 TOKENIZER_CACHE_DIR = ROOT_DIR / TOKENIZER_CACHE_DIR
 CKPT_PATH = ROOT_DIR / CKPT_PATH
 BEST_CKPT_PATH = ROOT_DIR / BEST_CKPT_PATH
+GLOVE_PATH = ROOT_DIR.parent / "glove.6B.300d.txt"
+GLOVE_DIM = 300
 
 
 torch.set_default_dtype(DEFAULT_DTYPE)
@@ -32,6 +34,7 @@ DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 AMP_DTYPE = torch.bfloat16
 USE_AMP = DEVICE.type == "mps"
 SWANLAB_API_KEY = os.getenv("SWANLAB_API_KEY", "ZnWwDCFzy78QEM12FZXCr")
+THRESHOLD_CANDIDATES = [threshold / 10 for threshold in range(1, 10)]
 
 
 def build_text(row: Dict[str, str]) -> str:
@@ -150,6 +153,52 @@ def tokenize_texts(
     return input_ids_list, attention_mask_list
 
 
+def glove_candidates_for_token(token: str | None) -> List[str]:
+    if token is None or token.startswith("<|"):
+        return []
+
+    stripped = token.lstrip("ĠĊ")
+    candidates: List[str] = []
+    for candidate in (token, token.lower(), stripped, stripped.lower()):
+        if candidate and candidate not in candidates and not candidate.startswith("<|"):
+            candidates.append(candidate)
+    return candidates
+
+
+def build_glove_embedding_weight(glove_path: Path, tokenizer: GPT2Tokenizer, embedding_dim: int) -> Tuple[torch.Tensor, int]:
+    token_to_ids: Dict[str, List[int]] = {}
+    for token_id in range(len(tokenizer)):
+        token = tokenizer.convert_ids_to_tokens(token_id)
+        for candidate in glove_candidates_for_token(token):
+            token_to_ids.setdefault(candidate, []).append(token_id)
+
+    embedding_weight = torch.empty(len(tokenizer), embedding_dim, dtype=torch.float32)
+    nn.init.normal_(embedding_weight, mean=0.0, std=0.02)
+
+    matched_token_ids = set()
+    with glove_path.open("r", encoding="utf-8") as f:
+        for line in tqdm(f, desc="Loading GloVe", leave=False):
+            values = line.rstrip().split()
+            if len(values) != embedding_dim + 1:
+                continue
+
+            word = values[0]
+            token_ids = token_to_ids.get(word)
+            if not token_ids:
+                continue
+
+            vector = torch.tensor([float(v) for v in values[1:]], dtype=embedding_weight.dtype)
+            for token_id in token_ids:
+                if token_id not in matched_token_ids:
+                    embedding_weight[token_id] = vector
+                    matched_token_ids.add(token_id)
+
+    if tokenizer.pad_token_id is not None:
+        embedding_weight[tokenizer.pad_token_id].zero_()
+
+    return embedding_weight, len(matched_token_ids)
+
+
 def build_tensor_dataset(
     texts: Sequence[str],
     tokenizer: GPT2Tokenizer,
@@ -211,19 +260,56 @@ def compute_binary_f1(preds: torch.Tensor, targets: torch.Tensor) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def compute_binary_metrics_at_threshold(
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float,
+) -> Tuple[float, float]:
+    preds = (probs > threshold).long().view(-1)
+    targets = targets.view(-1).long()
+    accuracy = (preds == targets).float().mean().item()
+    f1 = compute_binary_f1(preds, targets)
+    return accuracy, f1
+
+
+def find_best_threshold(
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    thresholds: Sequence[float] = THRESHOLD_CANDIDATES,
+) -> Tuple[float, float, float]:
+    best_threshold = 0.5
+    best_accuracy = 0.0
+    best_f1 = -1.0
+
+    for threshold in thresholds:
+        accuracy, f1 = compute_binary_metrics_at_threshold(probs, targets, threshold)
+        if (
+            f1 > best_f1
+            or (f1 == best_f1 and accuracy > best_accuracy)
+            or (
+                f1 == best_f1
+                and accuracy == best_accuracy
+                and abs(threshold - 0.5) < abs(best_threshold - 0.5)
+            )
+        ):
+            best_threshold = float(threshold)
+            best_accuracy = accuracy
+            best_f1 = f1
+
+    return best_threshold, best_accuracy, best_f1
+
+
 def evaluate(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
     desc: str = "Validate",
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float]:
     model.eval()
     total_loss = 0.0
-    total_correct = 0
     total_samples = 0
-    total_true_positive = 0
-    total_false_positive = 0
-    total_false_negative = 0
+    all_probs: List[torch.Tensor] = []
+    all_targets: List[torch.Tensor] = []
 
     progress = tqdm(dataloader, total=len(dataloader), desc=desc, leave=False)
     try:
@@ -235,25 +321,21 @@ def evaluate(
                     loss = criterion(logits, labels)
 
                 probs = torch.sigmoid(logits.float())
-                preds = (probs > 0.5).long().view(-1)
-                targets = labels.long().view(-1)
+                targets = labels.view(-1)
 
-                batch_size = targets.size(0)
+                batch_size = targets.numel()
                 total_loss += loss.item() * batch_size
-                total_correct += (preds == targets).sum().item()
                 total_samples += batch_size
-                total_true_positive += ((preds == 1) & (targets == 1)).sum().item()
-                total_false_positive += ((preds == 1) & (targets == 0)).sum().item()
-                total_false_negative += ((preds == 0) & (targets == 1)).sum().item()
+                all_probs.append(probs.view(-1).cpu())
+                all_targets.append(targets.cpu())
     finally:
         progress.close()
 
     avg_loss = total_loss / max(total_samples, 1)
-    accuracy = total_correct / max(total_samples, 1)
-    precision = total_true_positive / max(total_true_positive + total_false_positive, 1)
-    recall = total_true_positive / max(total_true_positive + total_false_negative, 1)
-    f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
-    return avg_loss, accuracy, f1
+    probs = torch.cat(all_probs) if all_probs else torch.empty(0)
+    targets = torch.cat(all_targets) if all_targets else torch.empty(0)
+    best_threshold, accuracy, f1 = find_best_threshold(probs, targets)
+    return avg_loss, accuracy, f1, best_threshold
 
 
 def evaluate_repeatedly(
@@ -262,14 +344,16 @@ def evaluate_repeatedly(
     criterion: nn.Module,
     repeat_times: int,
     desc: str = "Validate",
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float]:
     repeat_times = max(1, repeat_times)
     total_loss = 0.0
     total_acc = 0.0
     total_f1 = 0.0
+    best_threshold = 0.5
+    best_repeat_f1 = -1.0
 
     for repeat_idx in range(repeat_times):
-        eval_loss, eval_acc, eval_f1 = evaluate(
+        eval_loss, eval_acc, eval_f1, eval_threshold = evaluate(
             model,
             dataloader,
             criterion,
@@ -278,23 +362,27 @@ def evaluate_repeatedly(
         total_loss += eval_loss
         total_acc += eval_acc
         total_f1 += eval_f1
+        if eval_f1 > best_repeat_f1:
+            best_repeat_f1 = eval_f1
+            best_threshold = eval_threshold
 
     return (
         total_loss / repeat_times,
         total_acc / repeat_times,
         total_f1 / repeat_times,
+        best_threshold,
     )
 
 
 def build_tokenizer() -> GPT2Tokenizer:
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2", cache_dir=str(TOKENIZER_CACHE_DIR))
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2", cache_dir=str(TOKENIZER_CACHE_DIR), local_files_only=True)
     tokenizer.pad_token = tokenizer.eos_token
     if POOLING_TYPE.lower() == "cls":
         tokenizer.add_special_tokens({"cls_token": "<|cls|>"})
     return tokenizer
 
 
-def build_model(tokenizer: GPT2Tokenizer) -> nn.Module:
+def build_model(tokenizer: GPT2Tokenizer, pretrained_embedding_weight: torch.Tensor | None = None) -> nn.Module:
     return BinaryClassifyModel(
         len(tokenizer),
         HIDDEN_DIM,
@@ -303,6 +391,7 @@ def build_model(tokenizer: GPT2Tokenizer) -> nn.Module:
         N_ENCODER_LAYER,
         N_HEAD,
         pooling_type=POOLING_TYPE,
+        pretrained_embedding_weight=pretrained_embedding_weight,
     ).to(DEVICE)
 
 
@@ -316,20 +405,40 @@ def train() -> Path:
     eval_labels = [label for _, label in eval_samples]
 
     tokenizer = build_tokenizer()
+    if HIDDEN_DIM != GLOVE_DIM:
+        raise ValueError(f"HIDDEN_DIM ({HIDDEN_DIM}) must match GLOVE_DIM ({GLOVE_DIM}) when projection is disabled.")
+
+    glove_embedding_weight, glove_matched_count = build_glove_embedding_weight(
+        GLOVE_PATH,
+        tokenizer,
+        embedding_dim=GLOVE_DIM,
+    )
+    print(
+        f"GloVe initialized {glove_matched_count}/{len(tokenizer)} tokenizer entries "
+        f"({glove_matched_count / len(tokenizer):.2%})"
+    )
+
     train_dataset = build_tensor_dataset(train_texts, tokenizer, train_labels)
     eval_dataset = build_tensor_dataset(eval_texts, tokenizer, eval_labels)
 
     train_dataloader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
     eval_dataloader = DataLoader(eval_dataset, batch_size=VALID_BATCH_SIZE, shuffle=False)
 
-    model = build_model(tokenizer)
+    test_rows = read_test_rows(TEST_CSV_PATH)
+    test_ids = [sample_id for sample_id, _ in test_rows]
+    test_texts = [text for _, text in test_rows]
+    test_dataset = build_tensor_dataset(test_texts, tokenizer)
+    test_dataloader = DataLoader(test_dataset, batch_size=VALID_BATCH_SIZE, shuffle=False)
+
+    model = build_model(tokenizer, pretrained_embedding_weight=glove_embedding_weight)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     total_steps = TOTAL_EPOCHS * len(train_dataloader)
     scheduler = build_lr_scheduler(optimizer, total_steps)
 
     best_eval_acc = 0.0
-    best_eval_f1 = 0.0
+    best_eval_f1 = -1.0
+    best_threshold = 0.5
     global_step = 0
     swanlab.login(api_key=SWANLAB_API_KEY)
     swanlab.init(
@@ -363,6 +472,11 @@ def train() -> Path:
             "tokenizer": "gpt2",
             "pooling": POOLING_TYPE,
             "cls_token": tokenizer.cls_token if POOLING_TYPE.lower() == "cls" else None,
+            "glove_path": str(GLOVE_PATH),
+            "glove_dim": GLOVE_DIM,
+            "glove_matched_count": glove_matched_count,
+            "glove_match_ratio": glove_matched_count / len(tokenizer),
+            "threshold_candidates": THRESHOLD_CANDIDATES,
         },
     )
 
@@ -418,7 +532,7 @@ def train() -> Path:
 
                 if global_step % VALIDATE_INTERVAL == 0 or global_step == 1 or global_step == total_steps:
                     progress.clear()
-                    eval_loss, eval_acc, eval_f1 = evaluate_repeatedly(
+                    eval_loss, eval_acc, eval_f1, eval_threshold = evaluate_repeatedly(
                         model,
                         eval_dataloader,
                         criterion,
@@ -429,26 +543,33 @@ def train() -> Path:
                         f"step={global_step} "
                         f"eval_loss={eval_loss:.6f} "
                         f"eval_acc={eval_acc:.4f} "
-                        f"eval_f1={eval_f1:.4f}"
+                        f"eval_f1={eval_f1:.4f} "
+                        f"threshold={eval_threshold:.1f}"
                     )
+                    projected_best_eval_f1 = max(best_eval_f1, eval_f1)
+                    projected_best_eval_acc = eval_acc if eval_f1 >= best_eval_f1 else best_eval_acc
+                    projected_best_threshold = eval_threshold if eval_f1 >= best_eval_f1 else best_threshold
                     swanlab.log(
                         {
                             "valid/loss": eval_loss,
                             "valid/acc": eval_acc,
                             "valid/acc_percent": eval_acc * 100,
                             "valid/f1": eval_f1,
+                            "valid/threshold": eval_threshold,
                             "valid/epoch": epoch + 1,
                             "valid/global_step": global_step,
-                            "valid/best_eval_acc": max(best_eval_acc, eval_acc),
-                            "valid/best_eval_f1": max(best_eval_f1, eval_f1),
+                            "valid/best_eval_acc": projected_best_eval_acc,
+                            "valid/best_eval_f1": projected_best_eval_f1,
+                            "valid/best_threshold": projected_best_threshold,
                         },
                         step=global_step,
                     )
                     progress.refresh()
 
-                    if eval_acc > best_eval_acc:
+                    if eval_f1 > best_eval_f1:
                         best_eval_acc = eval_acc
-                        best_eval_f1 = max(best_eval_f1, eval_f1)
+                        best_eval_f1 = eval_f1
+                        best_threshold = eval_threshold
                         save_checkpoint(
                             BEST_CKPT_PATH,
                             model,
@@ -459,11 +580,20 @@ def train() -> Path:
                                 "global_step": global_step,
                                 "best_eval_acc": best_eval_acc,
                                 "best_eval_f1": best_eval_f1,
+                                "best_threshold": best_threshold,
                                 "eval_loss": eval_loss,
                                 "eval_ratio": EVAL_RATIO,
                                 "random_seed": RANDOM_SEED,
                             },
                         )
+                    predict_with_model(
+                        model,
+                        test_ids=test_ids,
+                        test_dataloader=test_dataloader,
+                        output_path=PREDICT_CSV_PATH,
+                        desc=f"Predict @{global_step}",
+                        threshold=eval_threshold,
+                    )
 
             progress.close()
     finally:
@@ -479,6 +609,7 @@ def train() -> Path:
             "global_step": global_step,
             "best_eval_acc": best_eval_acc,
             "best_eval_f1": best_eval_f1,
+            "best_threshold": best_threshold,
             "eval_ratio": EVAL_RATIO,
             "random_seed": RANDOM_SEED,
         },
@@ -487,17 +618,18 @@ def train() -> Path:
     return BEST_CKPT_PATH if BEST_CKPT_PATH.exists() else CKPT_PATH
 
 
-def load_trained_model(checkpoint_path: Path, tokenizer: GPT2Tokenizer) -> nn.Module:
+def load_trained_model(checkpoint_path: Path, tokenizer: GPT2Tokenizer) -> Tuple[nn.Module, float]:
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
     model = build_model(tokenizer)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    return model
+    threshold = checkpoint.get("metadata", {}).get("best_threshold", 0.5)
+    return model, float(threshold)
 
 
 def predict(checkpoint_path: Path) -> None:
     tokenizer = build_tokenizer()
-    model = load_trained_model(checkpoint_path, tokenizer)
+    model, threshold = load_trained_model(checkpoint_path, tokenizer)
 
     test_rows = read_test_rows(TEST_CSV_PATH)
     test_ids = [sample_id for sample_id, _ in test_rows]
@@ -515,7 +647,7 @@ def predict(checkpoint_path: Path) -> None:
                 with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
                     logits = model(input_ids, attention_mask)
                 probs = torch.sigmoid(logits.float()).view(-1)
-                predictions.extend((probs > 0.5).long().cpu().tolist())
+                predictions.extend((probs > threshold).long().cpu().tolist())
     finally:
         progress.close()
 
@@ -525,6 +657,39 @@ def predict(checkpoint_path: Path) -> None:
     submission_header = read_submission_header(SAMPLE_SUBMISSION_PATH)
     PREDICT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     with PREDICT_CSV_PATH.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(submission_header)
+        writer.writerows(zip(test_ids, predictions))
+
+
+def predict_with_model(
+    model: nn.Module,
+    test_ids: Sequence[str],
+    test_dataloader: DataLoader,
+    output_path: Path,
+    desc: str,
+    threshold: float,
+) -> None:
+    model.eval()
+    predictions: List[int] = []
+    progress = tqdm(test_dataloader, total=len(test_dataloader), desc=desc, leave=False)
+    try:
+        with torch.no_grad():
+            for batch in progress:
+                input_ids, attention_mask = [tensor.to(DEVICE) for tensor in batch]
+                with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
+                    logits = model(input_ids, attention_mask)
+                probs = torch.sigmoid(logits.float()).view(-1)
+                predictions.extend((probs > threshold).long().cpu().tolist())
+    finally:
+        progress.close()
+
+    if len(test_ids) != len(predictions):
+        raise ValueError("Prediction count does not match test sample count.")
+
+    submission_header = read_submission_header(SAMPLE_SUBMISSION_PATH)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(submission_header)
         writer.writerows(zip(test_ids, predictions))

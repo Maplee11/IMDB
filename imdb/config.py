@@ -7,7 +7,7 @@ IMDB_DATASET_DIR = "dataset/aclImdb"
 MAX_SEQ_LEN = 384
 
 # ========== Model Config ==========
-HIDDEN_DIM = 384
+HIDDEN_DIM = 300
 DEFAULT_DTYPE = torch.float32
 DROPOUT_RATE = 0.1
 N_ENCODER_LAYER = 2
